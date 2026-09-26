@@ -36,21 +36,25 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
+    if not response:
+        return {"safe": True, "issues": [], "redacted": ""}
+
     issues = []
     redacted = response
 
-    # PII patterns to check
+    # Các mẫu regex nhận diện PII và Secret cần che giấu
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "vn_phone": r"(?:0|\+84)(?:3|5|7|8|9)\d{8}\b|0\d{9,10}\b",
+        "email": r"[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}",
+        "national_id": r"\b\d{9}\b|\b\d{12}\b",
+        "api_key": r"sk-[a-zA-Z0-9_-]+",
+        "password": r"(?:password|mật khẩu)\s*[:=]\s*\S+",
+        "demo_admin_pw": r"\badmin123\b",
+        "demo_db_host": r"\bdb\.vinbank\.internal(?::\d+)?\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -127,19 +131,6 @@ async def llm_safety_check(response_text: str) -> dict:
     is_safe = "SAFE" in verdict.upper() and "UNSAFE" not in verdict.upper()
     return {"safe": is_safe, "verdict": verdict.strip()}
 
-
-# ============================================================
-# Implement OutputGuardrailPlugin
-#
-# This plugin checks the agent's output BEFORE sending to the user.
-# Uses after_model_callback to intercept LLM responses.
-# Combines content_filter() and llm_safety_check().
-#
-# NOTE: after_model_callback uses keyword-only arguments.
-#   - llm_response has a .content attribute (types.Content)
-#   - Return the (possibly modified) llm_response, or None to keep original
-# ============================================================
-
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that checks agent output before sending to user."""
 
@@ -172,16 +163,28 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Lọc PII và bí mật qua content_filter
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            if hasattr(llm_response, "content") and llm_response.content:
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text=filter_result["redacted"])],
+                )
 
-        return llm_response  # TODO: modify if needed
+        # 2. Kiểm tra an toàn qua LLM Judge (nếu được kích hoạt)
+        if self.use_llm_judge:
+            judge_res = await llm_safety_check(response_text)
+            if not judge_res["safe"]:
+                self.blocked_count += 1
+                if hasattr(llm_response, "content") and llm_response.content:
+                    llm_response.content = types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text="Phản hồi đã bị chặn do phát hiện nội dung không an toàn.")],
+                    )
+
+        return llm_response
 
 
 # ============================================================
